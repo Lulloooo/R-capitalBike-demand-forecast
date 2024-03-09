@@ -1,0 +1,1085 @@
+---
+title: "Forecast daily bike rental demand using time series models"
+author: "Luca Albertini"
+output: github_document
+always_allow_html: true
+---
+```{r setup, include=FALSE} 
+knitr::opts_chunk$set(warning = FALSE, message = FALSE) 
+```
+## Data Description
+The dataset contains the daily count of rental bike transactions between 01/2011 and 12/2012 in the Capital bikeshare system with the correpsonding weather and seasonal information
+**Data Source:** <https://archive.ics.uci.edu/ml/datasets/bike+sharing+dataset>
+
+## Goal of the Project
+
+A bike rental company aims to improve its demand forecasting accuracy to optimize its fleet managment and pricing strategy. The goal is to determine the optimal number of bikes to keep in every dock station and to set a dynamic changing price based on the predicted demand. There are 3 main targets:
+- Describe data to answer key questions to uncover insights.
+- Build well-validated time series models for forecasting future rental bikes demand.
+- Propose a dynamic pricing strategy based on demands movements due to different variables.
+
+## Load and Explore the Data
+
+Prior to start it is necessary to set the working directory, load the required packages and build some useful functions.
+``` {r packload, include = FALSE}
+##install the needed packagaes
+#install.packages()
+## load the needed packages
+library(ggplot2)
+library(dplyr)
+library(dbplyr)
+library(timetk)
+library(expss)
+library(psych)
+library(knitr)
+library(zoo)
+library(tseries)
+library(forecast)
+library(lubridate)
+library(seastests)
+library(trend)
+library(sos)
+library(astsa)
+library(urca)
+library(egcm)
+library(pracma)
+library(clordr)
+library(TSA)
+library(scales)
+# clear workspace
+rm(list = ls())
+```
+
+```{r functions}
+#function # count mild outliers
+find_mild_out <- function(X) {
+  iqr = IQR(X)
+  lowerq = quantile(X)[2]
+  upperq = quantile(X)[4]
+  lowmildborder = lowerq - (iqr*1.5)
+  upmildborder = upperq + (iqr*1.5)
+  print(mild_outliers <- length(which( X > upmildborder | X < lowmildborder)))
+}
+# function to count severe outliers
+find_severe_out <- function(X) {
+  iqr = IQR(X)
+  lowerq = quantile(X)[2]
+  upperq = quantile(X)[4]
+  lowsevborder = lowerq - (iqr*3)
+  upsevborder = upperq + (iqr*3)
+  print(severe_outliers <- length(which( X > upsevborder | X < lowsevborder)))
+}
+#function to replace outliers with avg
+rem_out <- function(c){
+  b <- boxplot(c, plot = FALSE)
+  s1 <- c
+  s1[which(c %in% b$out)] <- mean(c[which(! c %in% b$out)],na.rm=TRUE)
+  return(s1)
+}
+```
+Once done this preliminary operation, it is time to load the data frame.
+``` {r dataset, include = TRUE}
+## load day aggregate daya
+day = read.csv("in_data/day.csv", header =  TRUE, sep = ",")
+```
+Data is aggregated on a daily basis. Take a quick glance to data.
+```{r glimpse, include = TRUE}
+#glimpse(day) to see more details about the data
+## display the first and last 3 obs of the table
+head(day, 3)
+tail(day, 3)
+```
+Rename and label the variables to make them easier to understand.
+```{r rename & label, include = TRUE}
+## rename some variables to make them clearer
+names(day)[names(day) == "instant"] <- "index"
+names(day)[names(day) == "dteday"] <- "date"
+names(day)[names(day) == "yr"] <- "year"
+names(day)[names(day) == "mnth"] <- "month"
+names(day)[names(day) == "weathersit"] <- "weather"
+names(day)[names(day) == "atemp"] <- "temp_feel"
+names(day)[names(day) == "hum"] <- "humidity"
+names(day)[names(day) == "cnt"] <- "trb"
+#transform dates into date format
+day$date <- as.Date(day$date)
+## add lables
+#day
+day <- day %>%
+  apply_labels (season = "1winter;2spring;3summer;4fall",
+                        year= "0=2011;1=2012",
+                        workingday = "1=yes",
+                        temp = "normalized temperature",
+                        temp_feel = "perceived temperature",
+                        casual = "count of casual users",
+                        registered = "count of registered users",
+                        trb = "count of total rental bikes")
+```
+The df contains 731 observations of 16 variables. This are 2 years, with 1 leap year, of observations.
+
+#### Exploratory Statistics
+
+To have an understanding of the data, let's compute some general stastics about the 3 different user's types.
+```{r describe}
+daystat <- describe(day[,c("casual","registered","trb")], IQR = TRUE)
+daystas <- data.frame(daystat)
+kable(daystat, digits = 2)
+```
+Build a df named "users" with minimum and maximum values for casual rides, registered rides and total rides.
+```{r users df}
+users <- data.frame(max(day$casual), max(day$registered), max(day$trb),
+                    min(day$casual), min(day$registered), min(day$trb))
+users
+```
+Add some columns to the original df. In particular:
+
+- **regvstot**: how much rides in a day were registered rides respect to the total rides of that day * 100
+- **perreg**: max-scaling (value/max) of registered rides
+- **pertrb**: max-scaling of total rides
+- **percas**: max-scaling of casual rides
+
+```{r new var}
+#reg rides/total rides * 100
+day$regvstot <- (day$registered / day$trb)*100
+day <- day %>%
+  apply_labels (regvstot = "% of reg vs the total users")
+#max-scaling reg
+day$perreg <- day$registered / max(day$registered)
+day <- day %>%
+  apply_labels (perreg = "% respect the max registered")
+#max-scaling trb
+day$pertrb <- day$trb / max(day$trb)
+day <- day %>%
+  apply_labels (pertrb = "% respect the max total rides")
+#max-scaling cas
+day$percas <- day$casual / max(day$casual)
+day <- day %>%
+  apply_labels (percas = "% respect the max casuals")
+```
+Finally, some exploratory stastics for the entire df.
+```{r expstat}
+summary(day)
+```
+
+#### In-depth Statistics
+
+Compute statistics about number of total rides grouped by other variables. In particular, it will grouped byr year, season, month, working day and weather.
+```{r cond stat, echo = TRUE}
+#year
+year <- subset(data.frame(aggregate(day$trb  ~ day$year, FUN = mean), aggregate(day$trb  ~ day$year, FUN = sum)),
+              select = -day.year.1)
+colnames(year) <- c("year", "avg", "total")
+year
+## season
+szn <- subset(data.frame(aggregate(day$trb  ~ day$season, FUN = mean), aggregate(day$trb  ~ day$season, FUN = sum)),
+                  select = -day.season.1)
+colnames(szn) <- c("season", "avg", "total")
+szn
+## month
+mth <- subset(data.frame(aggregate(day$trb  ~ day$month, FUN = mean), aggregate(day$trb  ~ day$month, FUN = sum)),
+                  select = -day.month.1)
+colnames(mth) <- c("month", "avg", "total")
+mth
+## workingday
+wdy <- subset(data.frame(aggregate(day$trb  ~ day$workingday, FUN = mean), aggregate(day$trb  ~ day$workingday, FUN = sum)),
+              select = -day.workingday.1)
+colnames(wdy) <- c("workingday", "avg", "total")
+wdy
+## weather
+wth <- subset(data.frame(aggregate(day$trb  ~ day$weather, FUN = mean), aggregate(day$trb  ~ day$weather, FUN = sum)),
+              select = -day.weather.1)
+colnames(wth) <- c("weather", "avg", "total")
+wth
+```
+
+To visualize differences among periods, let's plot the respective boxplots:
+
+```{r plot, echo=FALSE}
+#trb x year
+ggplot(day, aes(x=year, y=trb, fill = factor(year), color = factor(year))) +
+  geom_boxplot(aes(group=year)) +
+  geom_jitter(color = "grey", size =0.4, alpha=0.9) +
+  scale_fill_manual(values = c("orange", "darkblue"), labels = c("2011","2012")) +
+  scale_color_manual(values = c("darkblue", "orange"), labels = c("2011","2012")) +
+  ggtitle("Users per year") +
+  theme(panel.grid = element_line(color = "grey"),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        panel.background = element_blank())
+#trb x season
+ggplot(day, aes(x=season, y=trb, fill = factor(season))) +
+  geom_boxplot(aes(group=season))+
+  geom_jitter(color = "grey", size =0.4, alpha=0.9) +
+  scale_fill_manual(values = c("lightblue", "darkgreen", "yellow", "orange"), labels = c("winter","spring", "summer","fall"))+
+  ggtitle("Users per seasons") +
+  theme(panel.grid = element_line(color = "grey"),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        panel.background = element_blank())
+#trb x workingday
+ggplot(day, aes(x=workingday, y=trb, fill = factor(workingday), color = factor(workingday))) +
+  geom_boxplot(aes(group=workingday)) +
+  geom_jitter(color = "grey", size =0.4, alpha=0.9) +
+  scale_fill_manual(values = c("orange", "darkblue"), labels = c("notwork","workingday")) +
+  scale_color_manual(values = c("darkblue", "orange"), labels = c("notwork","workingday")) +
+  ggtitle("Users grouped by working day") +
+  theme(panel.grid = element_line(color = "grey"),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        panel.background = element_blank())
+#trb x weather -> FIX THIS
+ggplot(day, aes(x=weather, y=trb, fill = factor(weather), color = factor(weather))) +
+  geom_boxplot(aes(group=weather)) +
+  geom_jitter(color = "grey", size =0.4, alpha=0.9) +
+  scale_fill_manual(values = c("orange", "darkblue", "lightblue"), labels = c("clear","mist + cloudy", "snow")) +
+  scale_color_manual(values = c("darkblue", "orange", "darkgreen"), labels = c("clear","mist + cloudy", "snow")) +
+  ggtitle("Users grouped by weather") +
+  theme(panel.grid = element_line(color = "grey"),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        panel.background = element_blank())
+```
+
+To obtain an idea of possible relations between variables, a scatterplot may help. Let's consider total bike rides against temperature.
+
+```{r scpt temp, echo =FALSE}
+ggplot(day, aes(x=temp, y=trb)) +
+  geom_point(size = 1, color = "darkblue") +
+  geom_smooth(method=lm, linetype = "dashed", color = "darkorange", fill = "orange") +
+  ggtitle("Total users vs Normalized temperature") +
+  xlab("Norm. Temperature") + ylab("Total Users") +
+  theme(panel.grid = element_line(color = "lightgrey"),
+        panel.background = element_blank())
+```
+
+The scatterplot suggest a small positive relation between temperature and trb. This in line with the common idea that the warmer the weather, the more likely people will ride bikes.
+Scatterplots of total rides against humidity and total rides against wind speed provide even more information.
+
+```{r hum wind scpt, echo=FALSE}
+#scatterplot trb vs windspeed
+ggplot(day, aes(x=windspeed, y=trb)) +
+  geom_point(size = 1, color = "darkblue") +
+  geom_smooth(method=lm, linetype = "dashed", color = "darkorange", fill = "orange") +
+  ggtitle("Total users vs wind speed") +
+  xlab("Wind Speed") + ylab("Total Users") +
+  theme(panel.grid = element_line(color = "lightgrey"),
+        panel.background = element_blank())
+#scatterplot trb vs humidity
+ggplot(day, aes(x=humidity, y=trb)) +
+  geom_point(size = 1, color = "darkblue") +
+  geom_smooth(method=lm, linetype = "dashed", color = "darkorange", fill = "orange") +
+  ggtitle("Total users vs humidity") +
+  xlab("Humidity") + ylab("Total Users") +
+  theme(panel.grid = element_line(color = "lightgrey"),
+        panel.background = element_blank())
+```
+
+Within both of these charts the points are distributed without following some sort of linear relation. Interestingly, bike rides tend to cluster in the areas where wind speed is lower and where humidity is higher.
+Be aware that these are just raw insights. To properly identify this kind of relation it is necessary to model the data.
+
+## Plot the variables
+
+Plotting time series variables is a fundemantal step in every forecasting analysis. Through charts, it would be possible to discover more information about the nature of the time series. To perform this task the most useful packages are "timetk" and "zoo". 
+Firstly, let's transform the variables into ts object. Then, plot the variable the study is interested into.
+```{r ts}
+#transform data into time series
+casts <- zoo(day$casual, seq(from = as.Date("2011-01-01"), to = as.Date("2012-12-31"), by = 1))
+regts <- zoo(day$registered, seq(from = as.Date("2011-01-01"), to = as.Date("2012-12-31"), by = 1))
+trbts <- zoo(day$trb, seq(from = as.Date("2011-01-01"), to = as.Date("2012-12-31"), by = 1))
+```
+Now casual, registered and trb are ts objects that go from 01/01/2011 to 12/31/2012. 
+
+#### Weather related variables
+
+Plot weather-related variables to gain a general understanding of the situation:
+
+- Temperature vs perceived temperature
+
+```{r temp, echo =FALSE}
+#temperature vs temperature felt
+colors <- c("temp" = "darkblue", "temp_feel" = "orange")
+tempvstfeel_plot <- day %>% 
+  ggplot(aes(x=date)) +
+  geom_line(aes(y=temp, color = "temp")) +
+  geom_line(aes(y=temp_feel, color = "temp_feel"), alpha = 0.6) +
+  labs ( x = "date", y = "value", color = "Legend", title = "Temperature vs perceived Temperature") +
+  scale_color_manual(values = colors) +
+  theme(panel.grid = element_line(color = "grey"),
+        panel.background = element_blank())
+tempvstfeel_plot
+```
+
+As predictable, temperature shows some seasonal patterns. Moreover, the perceived temperature resembles (less or more) the temperature, except for one point that should be investigated more.
+
+- Humidity plot
+
+```{r hum, echo = FALSE}
+hum_plot <- day %>% 
+  plot_time_series(.date_var = date, .value = humidity, .interactive=FALSE, 
+                   .title = "Humidity", .y_lab = "humidity", .x_lab = "date",
+                   .line_color= "darkblue", .smooth_color = "orange")
+hum_plot
+```
+
+Humidity does not display neither some trend nor some sort of seasonality. Yet it shows an extremly low value (possible outlier) around 2011-03-10.
+
+- Wind speed plot
+
+```{r windspeed, echo = FALSE}
+wind_plot <- day %>% 
+  plot_time_series(.date_var = date, .value = windspeed, .interactive=FALSE, 
+                   .title = "Windspeed", .y_lab = "windspeed", .x_lab = "date",
+                   .line_color= "darkblue", .smooth_color = "orange")
+wind_plot
+```
+
+Wind speed does not show neither some trend nor some sort of seasonality. It may be useufl to investigate more for outliers.
+
+#### Usage-related variables
+
+The usage-related variables are registered rides, casual rides andtotal rides. Note that the total rides are the sum of the casual and registered rides.
+
+- Casual rides plots
+
+```{r cas plot, echo = FALSE}
+cas_plot <- day %>% 
+  plot_time_series(.date_var = date, .value = casual, .interactive=FALSE, 
+                   .title = "Casual rides", .y_lab = "number of casual rides", .x_lab = "date",
+                   .line_color= "darkblue", .smooth_color = "orange")
+cas_plot
+```
+
+Plotting by dividing per year and highlighting different seasons.
+
+```{r cas plot seas, echo = FALSE}
+castot <- day %>% 
+  group_by(year) %>% 
+  plot_time_series(date, casual, .color_var = as.factor(season),
+                   .x_lab = "Date", .y_lab = "Casual rides", .title = "Casual rides vs Date", .interactive = FALSE)
+castot
+```
+
+The plot suggest a slight increase in casual users in the second year. Ts may have a seasonality component. 
+
+- Registered rides plots
+
+```{r reg plot, echo = FALSE}
+reg_plot <- day %>% 
+  plot_time_series(.date_var = date, .value = registered, .interactive=FALSE, 
+                   .title = "Registered rides", .y_lab = "number of registered rides", .x_lab = "date",
+                   .line_color= "darkblue", .smooth_color = "orange")
+reg_plot
+```
+
+Plotting by dividing per year and highlighting different seasons.
+
+```{r reg plot seas, echo = FALSE}
+regtot <- day %>% 
+  group_by(year) %>% 
+  plot_time_series(date, registered, .color_var = as.factor(season),
+                   .x_lab = "Date", .y_lab = "Registered rides", .title = "Registred rides vs Date", .interactive = FALSE)
+regtot
+```
+
+Registered users experienced an increased by the beggining of the second year (2012). Overall, there may be seasonality even in this ts.
+
+- Total rides plot
+
+```{r tot plot, echo = FALSE}
+trb_plot <- day %>% 
+  plot_time_series(.date_var = date, .value = trb, .interactive=FALSE, 
+                   .title = "Total rides", .y_lab = "number of total rides", .x_lab = "date",
+                   .line_color= "darkblue", .smooth_color = "orange")
+trb_plot
+```
+
+Plotting by dividing per year and highlighting different seasons.
+
+```{r tot plot2, echo = FALSE}
+trbtot <- day %>% 
+  group_by(year) %>% 
+  plot_time_series(date, trb, .color_var = as.factor(season),
+                   .x_lab = "Date", .y_lab = "Total rides", .title = "total rides vs Date", .interactive = FALSE)
+trbtot
+```
+
+Total rides increased in 2012. Plots above suggest that this is a consequence of the sharp increase in the registered users for the same year. Likely, data is seasonal with a frequency of 365. Probably this series is of the additive (trend+seasonality) type.
+
+- Scaled variables plot
+
+```{r comp var, echo = FALSE}
+#registered rides vs total rides
+regvstot_plot <- day %>% 
+  group_by(year) %>% 
+  plot_time_series(date, regvstot, .color_var = as.factor(season),
+                   .x_lab = "Date", .y_lab = "registered rides/total rides", .title = "registered rides against total rides", .interactive = FALSE)
+regvstot_plot
+#registered rides vs registered maximum ride
+perreg_plot <- day %>% 
+  group_by(year) %>% 
+  plot_time_series(date, perreg, .color_var = as.factor(season),
+                   .x_lab = "Date", .y_lab = "reg rides/max reg rides", .title = "registered rides against its maximum", .interactive = FALSE)
+perreg_plot
+#casual rides vs casual maximum rides
+percas_plot <- day %>% 
+  group_by(year) %>% 
+  plot_time_series(date, percas, .color_var = as.factor(season),
+                   .x_lab = "Date", .y_lab = "casual rides/max casual rides", .title = "casual rides against its maximum", .interactive = FALSE)
+percas_plot
+#trb rides vs trb maximum ried
+pertrb_plot <- day %>% 
+  group_by(year) %>% 
+  plot_time_series(date, pertrb, .color_var = as.factor(season),
+                   .x_lab = "Date", .y_lab = "total rides/max total rides", .title = "total rides against its maximum", .interactive = FALSE)
+pertrb_plot
+```
+
+## Focuse on Total users
+
+The focus will now be shifted only to the number of total rides since the main goal of the research is to predict its future values. Let's perform a seasonal analysis on this ts.
+
+```{r szn plot, echo = FALSE}
+szn_plot <- day %>% 
+  group_by(year(date)) %>% 
+  plot_seasonal_diagnostics(.date_var = date, .value = trb, 
+                            .x_lab = "Date", .y_lab = "total rides", .title = "Seasonal Analysis",
+                            .geom_color = "darkblue", .geom_outlier_color = "orange" , .interactive = FALSE )
+szn_plot
+```
+
+As this chart highlights, data has some outliers.It is fundamental to deal with these points prior to start forecasting.
+
+```{r anom an, echo = FALSE}
+#anomaly (i.e outliers) diagnostic plot for total rides
+trbanom <- day %>% 
+  plot_anomaly_diagnostics(.date_var = date, .value = trb,
+                           .line_color = "darkblue", .anom_color = "orange", 
+                           .x_lab = "Date", .y_lab = "Total rides", .title = "Total rides anomalies", .interactive=FALSE)
+trbanom
+```
+
+The charts highlight the presence of 7 outliers, amongst which 4 are severe. These values must be examined later and, if needed, replaced. The function tsclean() will do exactly that.
+
+```{r outliers remov, echo = FALSE}
+#### smooth trb, casual and registered by identifying and replacing outlies
+trbc <- tsclean(trbts, replace.missing = TRUE, iterate = 2, lambda = NULL)
+regc <- tsclean(regts, replace.missing = TRUE, iterate = 2, lambda = NULL)
+casc <- tsclean(casts, replace.missing = TRUE, iterate = 2, lambda = NULL)
+trbc_ts <- ts(trbc, start = c(2011), frequency = 365)
+#insert it all in a df
+smth <- data.frame(day$date,trbc,regc, casc)
+smth$trbc <- zoo(smth$trbc, seq(from = as.Date("2011-01-01"), to = as.Date("2012-12-31"), by = 1))
+smth$regc <- zoo(smth$regc, seq(from = as.Date("2011-01-01"), to = as.Date("2012-12-31"), by = 1))
+smth$casc <- zoo(smth$casc, seq(from = as.Date("2011-01-01"), to = as.Date("2012-12-31"), by = 1))
+#double check outliers in trb
+out <- tsoutliers(trbc)
+trbc[out$index] <- out$replacements
+#double check for anomalies
+smth %>% 
+  plot_anomaly_diagnostics(.date_var = day.date, .value = trbc,
+                           .line_color = "darkblue", .anom_color = "orange",
+                           .alpha = 0.05, .x_lab = "Date", .y_lab = "Total rides", .title = "Total rides anomalies", .interactive=FALSE)
+
+```
+
+Now there are no-more sever outliers. 3 outliers have not been removed, yet it seems reasonal to keep them since they are neither computing error nor so much far away from the other observation (i.e 2 of them are in the alpha 0.05 border and the thrid one is really close). As such, this "corrected" trb time series will be the one analyzed.
+Note that even the registered and casuals users time series have been smoothed for outliers, in case they may be needed later on.
+
+## Smoothing time series
+
+Smoothing time series is a method to reveal underlying trends and identify components that a ts may have. Its aim is to reduce the noise to emphasize signals. Both exponential and moving average techniques will be employed.
+
+#### Moving Averages
+
+The most widespread techniques to smooth time series is to employ moving averages. In this specific case, moving averages at 90, 30 and 7 days will be employed with the aim to reduce noise and spot some features of the total rides amount.
+
+```{r SMA, echo = FALSE}
+#szn
+trbsma90 <- TTR::SMA(trbc, n = 90)
+#mth
+trbsma30 <- TTR::SMA(trbc, n = 30)
+#week
+trbsma07 <- TTR::SMA(trbc, n = 7)
+#plot them altogether 
+par(mar = c(5,4,4,8),
+    xpd = TRUE)#this is fundamental to place the legend outside the box of the chart
+plot(trbc, xlab = "date", ylab = "trb", main = "SMA of total rides", col = alpha("black", alpha = 0.3))
+lines(trbsma90, lty=2, col = "darkorange")
+lines(trbsma30, lty=2, col = "darkblue")
+lines(trbsma07, lty=2, col = "darkgreen")
+legend(x="topright", inset = c(-0.3,0), lty = c(4,6), col = c("orange", "darkblue", "darkgreen"), legend =c("SMA90", "SMA30", "SMA07"))
+```
+
+As predictable, the 7-days SMA still embeds some noise. However, both the 30-day and 90-days SMA help in understanding the path of total rides. Users experiences an upward trend from the begging of the year to few months after July, then they usually start to decrease. What is more striking, however, is the sharp upward trend in the period that goes from March/April to July both in 2011 and 2012.
+In raw terms, this chart suggests that may be a good idea to increase prices in these period in order to increase earnings, while may be useful to decrease price during the downturn in rides in order to attract more customer
+**Note**. The data seems to display a 365 day period seasonality. However, the time spawn is to short to assess this. There may be the necessity to enlarge the focus and include more years to effectively understand this.
+
+Exponential Moving Averages, which apply more weight to more recent data, confirm the insights above.
+
+```{r EMA, echo = FALSE}
+#szn
+trbema90 <- TTR::EMA(trbc, n = 90)
+#mth
+trbema30 <- TTR::EMA(trbc, n = 30)
+#week
+trbema07 <- TTR::EMA(trbc, n = 7)
+#plot them altogether 
+par(mar = c(5,4,4,8),
+    xpd = TRUE) #this is fundamental to place the legend outside the box of the chart
+plot(trbc, xlab = "date", ylab = "trb", main = "EMA of total rides", col = alpha("black", alpha = 0.3) )
+lines(trbema90, lty=2, col = "orange")
+lines(trbema30, lty=2, col = "darkblue")
+lines(trbema07, lty=2, col = "darkgreen")
+legend(x="topright", inset = c(-0.3,0), lty = c(4,6), col = c("orange", "darkblue", "darkgreen"), legend =c("EMA90", "EMA30", "EMA07"))
+```
+
+#### Exponential smoothing (Holt Winters)
+
+Exponential smoothing consists in a smoothing tecnhique that assigns exponentially decreasing weights over time. It is alpha's value that express the base value, and the higher it is the higher the emphasis on more recent observation. Parameters beta and gamma, instead, refer respectively to the trend value and the seasonal component. Even a seasonal HW will be considered.
+
+```{r Hw}
+par(mfrow = c(1,1))
+#if the coeff is closed to zero, it may means that forecast may be bases on seasonality in general
+trbHw1 <- HoltWinters(trbc_ts, gamma = FALSE, l.start = 985)
+trbHw2 <- HoltWinters(trbc_ts, beta = FALSE, gamma = FALSE, l.start = 985)
+trbHw3 <- HoltWinters(trbc_ts, seasonal = "additive", l.start = 985)
+#calculate the sum of the squared errors for the insample forecast errors
+#i.e the erros for the time period covered by the original ts
+trbHw1$SSE
+trbHw2$SSE
+trbHw3$SSE
+```
+
+Plot the results of the Holt Winter models
+
+```{r HW plot, echo = FALSE}
+#lot to see what it fits best
+par(mar = c(5,4,4,8),
+    xpd = TRUE) #this is fundamental to place the legend outside the box of the chart
+plot(trbc_ts, col = alpha("black", alpha = 0.3))
+lines(trbHw1$fitted[,1], lty=2, col = "orange")
+lines(trbHw2$fitted[,1], lty=2, col = "darkblue")
+lines(trbHw3$fitted[,1], lty=2, col = "darkgreen")
+legend(x="topright", inset = c(-0.3,0), lty = c(4,6), col = c("orange", "darkblue", "darkgreen"), legend =c("Hw1", "Hw2", "Hw Seasonal"))
+#calculate the sum of the squared errors for the insample forecast errors
+```
+
+The HW models catch nicely the total rides movements. They succeed in reducing daily noise and confirm the pattern spotted above. To really smooth the time series, however, it is possible to play alpha and set it to a lower value (such as 0.1). The seasonal one (green line) is the one that display more oscillations and issues, since in the first point it goes below zero. 
+
+```{r alpha, echo = FALSE}
+#lower alpha
+trbalpha <- HoltWinters(trbc, alpha = 0.1, beta = FALSE, gamma = FALSE, l.start = 985)
+par(mar = c(5,4,4,8),
+    xpd = TRUE) 
+plot(trbc, col = alpha("darkblue", alpha = 0.3))
+lines(trbalpha$fitted[,1], lty=2, col = "orange")
+legend(x="topright", inset = c(-0.3,0), lty = c(4,6), col = c("orange"), legend =c("Hw_a"))
+
+```
+
+The orange line is now smoother. Again, this confirm the insights form the moving averages.
+
+## Stationarity
+
+Understand if a time series is stationary is fundamental in the choice of model's parameters. Indeed, some model require stationary ts, while others work even with non-stationary ts. There are several test that look for stationarity and/or the presence of a unit root. Here, the Augmented Dickey Fueller test, the KPSS test, the PP test and a test for the unit root variance ratio will be implemented.
+Prior to perform these tests, let's plot the autocorrelation and partial autocorrelation plots for the number of total users.
+
+```{r trb acf, echo = FALSE}
+#trb
+acf(na.omit(trbc), lag.max = 731, main ="trb autocorrelation")
+#trb pacf
+pacf(trbc,lag.max = 731, main = "trb partial-autocorrelation")
+```
+
+Overall, there is a strong correlation between subsequent observations. However, it varies in its direction (from positive to negative and viceversa). Particularly striking is the high correlation in the first 100 lags. The partial autocorrelation plots display a strong correlation between the first observations too. After those, there are not so many significant lags . Again, the direction of the autocorrelation varies. 
+These charts suggests the presence of an AR (the acf) and likely the presence of a Moving average (MA).
+
+The next step is to test for the presence of a Unit root. To do so, an ADF test and a PP test will be performed. In both of these tests, the null-hypothesis is the presence of a unit root.
+
+```{r adf PP}
+#ADF
+summary(ur.df(trbc, 
+              type = "trend", 
+              lags = 180, 
+              selectlags = "BIC"))
+#adf test, =/ command
+adf.test(trbc)
+#pp test
+pp.test(trbc, type = "Z(alpha)") #stationarity
+pp.test(trbc, type = "Z(t_alpha") #stationarity
+```
+
+The results of the ADF points to the presence of unit roots. Yet, it does not have a trend nor a drift. However, the PP test gives the opposite results pointing to the absence of a unit root (i.e the ts is stationary). 
+To clear the doubts, a KPSS test will be performed. In this case, the null-hypothesis is that the ts is trend stationary, while the alternative is the presence of a unit root.
+
+```{r KPSS}
+kpss.test(trbc, null = "Trend")#there is a unit root
+```
+
+The results point to the presence of a unit root. Finally, a test for unit roots variance ratio has been implemented.
+
+```{r bvr}
+bvr.test(trbc)
+```
+
+The Bvr test highlights the presence of a unit root, yet the variance (rho) is really close to the case of no unit root. This suggests that this ts may become stationary if differentiated by 1 (i.e is a I(1) ts). Let's verify this.
+
+```{r difftrb}
+#differentiate trb
+diftrb <- diff(trbc, lag=1)
+#adf1
+summary(ur.df(diftrb, 
+              type = "trend", 
+              lags = 180, 
+              selectlags = "BIC"))
+#no unit root
+#adf2
+adf.test(diftrb)
+#no unit root
+#pp
+pp.test(diftrb, type = "Z(alpha)")#stationarity
+pp.test(diftrb, type = "Z(t_alpha")#stationarity
+#kpss
+kpss.test(diftrb, null = "Trend")
+#trend stat
+#bvr
+bvr.test(diftrb)
+#stationarity
+```
+
+These tests confirm the previous intuition. Once differentiate by lag 1, trb becomes a stationary time series. Hence, the proper forecasting model is ARIMA with d = 1.
+
+## Forecasting and Testing
+
+Decompose the ts in order to access its components.
+
+```{r dec trb}
+componentstrb <- decompose(trbc_ts)
+plot(componentstrb)
+```
+
+Decomposing show both an increasing trend and a seasonality with a frequency of 365 (yearly). Note that our series has just 2 seasons, since it covers just 2011 and 2012. This may be a limitation that will be discussed later.
+Prior to forecast employing an ARIMA model, it is possible to forecast using the previous Holt Winters estimation. In this case, the holt winter model that considers seasonality will be employed.
+
+```{r Hw for, echo = FALSE}
+#forecast
+Hw3for <- forecast(trbHw3, h = 30)
+#plot the forecasts
+trbc_ts %>% 
+  autoplot(col = "darkblue", xlab = "Date", ylab = "Number of total rides", 
+           main = "Seasonal Holt Winter Testing") +
+  autolayer(Hw3for, series = "Hw forecasts", col = "darkorange") +
+  theme(panel.grid = element_line(color = "lightgrey"),
+        panel.background = element_blank())
+```
+
+The HW model suggests, as predictable, an high volatility in day-to-day bike rides. It also points to a feeble positive trend in January 2013.
+
+To accurately forecast future bike usage, an ARIMA model will be employed. 
+The first thing to do is to split the time series into training and testing data. In this specific case, last month's observations (12/12) will be the testing data. This is reasonable since the aim is to build a model that can forecast 31days ahead.
+
+```{r tt tr}
+tr <- trbc_ts[1:700]
+tt <- trbc_ts[701:730]
+tr <- ts(data = tr, start = c(2011), frequency = 365)
+tt <- ts(data = tt, start = c(2012, 335), frequency = 365)
+```
+
+Once split the data, it is necessary to determine the parameters for the ARIMA model (p,D,q). Since the total bike rides is I(1), then D will be equal to 1. Instead, to have an idea of p and q, the autocorrelogram and the partial-autocorrelogram may help.
+
+```{r acf pacf, echo=FALSE}
+acf(trbc_ts[1:731], main = "Total rides autocorrelogram", lag = 50) #there is an MA components, high spikes point to q
+pacf(trbc_ts[1:731], main = "Total rides partial-autocorrelogram", lag = 50) #high spikes point to p
+```
+
+The acf is useful for the MA (q) part, while the pacf is useful for the Ar(p) part. The spikes in acf points to q while the ones in pacf points to p. According to these insights, p could be up to lag 6 while q can be even larger. Remember that a common rule of thumb is to keep the model as simple as possible. Yet, both the autocorrelation plots point to AR and MA. Again, these are just insights.
+
+Now an ARIMA model can be estimated. auto.arima will help in estimating the parameters automatically
+
+```{r auto arima}
+arima1 <- auto.arima(tr, d=1)
+arima1
+```
+
+However, this model is lacking of the seasonal components. Hence, re-estimate a SARIMA model with the auto.arima command.
+
+```{r auto Sarima}
+arima1s <- auto.arima(tr, d=1, D=1, trace = TRUE)
+arima1s
+```
+
+The next step is to manually estimate ARIMA models. At this point, different models will be estimated through a trial and error process. The model with the lowest AIC will be selected.
+
+```{r arima test}
+arima1sm <- Arima(tr, order = c(0,1,2), seasonal = list(order = c(0,1,0)))
+arima2 <- Arima(tr, order = c(1,1,1), seasonal = list(order = c(0,1,0)))
+arima3 <- Arima(tr, order = c(1,1,2), seasonal = list(order = c(0,1,0)))
+arima4 <- Arima(tr, order = c(2,1,1), seasonal = list(order = c(0,1,0)))
+arima5 <- Arima(tr, order = c(6,1,1), seasonal = list(order =c(0,1,0)))
+arima6 <- Arima(tr, order = c(6,1,2), seasonal = list(order= c(0,1,0)))
+#see the AIC for every model -> the AIC is better suited for model prediction, the BIC for model explanation
+arima1$aic
+arima1s$aic
+arima1sm$aic
+arima2$aic
+arima3$aic
+arima4$aic
+arima5$aic #lower AIC
+arima6$aic
+```
+
+Sarima(6,1,1)(0,1,0) and Sarima(1,1,1)(0,1,0) appear to be the ones with the lowest values. As such, they are the two model that will be employed for forecasting.
+
+```{r forecast}
+forar2 <- forecast(arima2, h=31)
+forar5 <- forecast(arima5, h=31)
+forar2
+forar5
+```
+
+Plot the results with the forecast for Sarima(1,1,1)(0,1,0).
+
+```{r Arima2 plot, echo = FALSE}
+par(mar = c(5,4,4,8),
+    xpd = TRUE) 
+forar2 %>% 
+  plot(col = alpha("darkblue", alpha = 0.70), shaded = TRUE, shadecols = alpha("darkblue", alpha = 0.30), fcol ="darkblue",  
+       main = "Forecasting test series with SArima (1,1,1)(0,1,0)", xlab = "Date", ylab="total rides",
+       bty = "l", xaxt="n") #this removes the box
+lines(tt, main = "Test Data", colour = TRUE, col = "darkorange")
+ticks <- axTicks(1) #find where are the x ticks and give them a name
+axis(1, at = ticks, label = c(2011.01, 2011.06, 2012.01, 2012.06, 2013.01)) #rename the x ticks
+#grid(nx= NA, ny = NULL, lty = 2, col = "lightgray", lwd = 2) #this adds the grid
+legend(x="topright", inset = c(-0.3,0), lty = c(1,1), legend = c("Prediction", "Actual Data"), col = c("darkblue", "darkorange"))
+
+```
+
+To be clearer, zoom the chart to focus only on the last 90 observations.
+
+```{r Arima plotsh, echo=FALSE}
+par(mar = c(5,4,4,8),
+    xpd = TRUE) #place the legend outside
+forar2 %>% 
+plot(col = alpha("darkblue", alpha = 0.70), shaded = TRUE, shadecols = alpha("darkblue", alpha = 0.30), fcol ="darkblue",  
+     main = "Forecasting test series with SArima (1,1,1)(0,1,0)", xlab = "Last 90 days of 2012", ylab="total rides",
+     include = 90, bty = "l",  xaxt = "n") #this removes the box
+lines(tt, main = "Test Data", colour = TRUE, col = "darkorange")
+legend(x="topright", inset = c(-0.3,0), lty = c(1,1), legend = c("Prediction", "Actual Data"), col = c("darkblue", "darkorange"))
+```
+
+Now plot the results of Sarima(6,1,1)(0,1,0).
+
+```{r Arima5 plot, echo=FALSE}
+#Arima 5
+#all values
+par(mar = c(5,4,4,8),
+    xpd = TRUE) 
+forar5 %>% 
+  plot(col = alpha("darkblue", alpha = 0.70), shaded = TRUE, shadecols = alpha("darkblue", alpha = 0.30), fcol ="darkblue",  
+       main = "Forecasting test series with SArima (6,1,1)(0,1,0)", xlab = "Date", ylab="total rides",
+       bty = "l", xaxt="n") #this removes the box
+lines(tt, main = "Test Data", colour = TRUE, col = "darkorange")
+ticks <- axTicks(1) #find where are the x ticks and give them a name
+axis(1, at = ticks, label = c(2011.01, 2011.06, 2012.01, 2012.06, 2013.01)) #rename the x ticks
+#grid(nx= NA, ny = NULL, lty = 2, col = "lightgray", lwd = 2) #this adds the grid
+legend(x="topright", inset = c(-0.3,0), lty = c(1,1), legend = c("Prediction", "Actual Data"), col = c("darkblue", "darkorange"))
+
+```
+
+Again, zoom in to have a narrower focus on the last 90 observations.
+
+```{r Arima5 plotsh, echo=FALSE}
+par(mar = c(5,4,4,8),
+    xpd = TRUE) #place the legend outside
+forar5 %>% 
+  plot(col = alpha("darkblue", alpha = 0.70), shaded = TRUE, shadecols = alpha("darkblue", alpha = 0.30), fcol ="darkblue",  
+       main = "Forecasting test series with SArima (6,1,1)(0,1,0)", xlab = "Last 90 days of 2012", ylab="total rides",
+       include = 90, bty = "l",  xaxt = "n") #this removes the box
+lines(tt, main = "Test Data", colour = TRUE, col = "darkorange")
+legend(x="topright", inset = c(-0.3,0), lty = c(1,1), legend = c("Prediction", "Actual Data"), col = c("darkblue", "darkorange"))
+```
+
+To compare the model, plot them altogether in the same chart.
+
+```{r arima tog, echo=FALSE}
+par(mar = c(5,4,4,8),
+    xpd = TRUE) #place the legend outside
+forar5 %>% 
+  plot(col = alpha("darkblue", alpha = 0.70), shaded = TRUE, shadecols = alpha("darkblue", alpha = 0.30), fcol ="darkblue",  
+       main = "Sarima (6,1,1) vs Sarima(1,1,1)", xlab = "Last 90 days of 2012", ylab="total rides",
+       include = 90, bty = "l",  xaxt = "n") #this removes the box
+lines(tt, main = "Test Data", colour = TRUE, col = "darkorange")
+lines(forar2$mean, main = "Arima2", col = "darkred")
+legend(x="topright", inset = c(-0.3,0), lty = c(1,1), legend = c("Actual data","SArima (6,1,1)", "Sarima(1,1,1)"), col = c("darkorange", "darkblue", "darkred"))
+```
+
+As evident, the two models look pretty similar except for the first forecasts. Both the estimations appear to catch the donward tendency of the data and almost all the testing points are within the forecasting interval. However, it happens that the models tend fail in completely getting the magnitude of the movements. To obtain clear insights about this point, let's plot the accuracy measures.
+
+```{r accuracy}
+accuracy(arima5)
+accuracy(arima2)
+```
+
+The accuracy metrics confirm that Sarima(6,1,1)(0,1,0) is the best model. As regards, the MAPE shows that on average the prediction of the model are around 8% off than the real values. This is not a bad result. The MAE suggest that the average absolute error is in the order of 400 rides. This seems pretty good since the total rides are in the order of the thousands per day. The difference between MAE and RMSE points to a considerable variance among the errors. ACF1, instead, highlights a low autocorrelation between errors at lag1.
+
+In order to forecast rides for January 2013, the SARIMA(6,1,1)(0,1,0) model must be fitted in the whole set of data. Then, it is possible to do a 31-day ahead forecast.
+
+```{r Sarima Jan}
+Sarima <- Arima(trbc_ts, order = c(6,1,1), seasonal = list(order=c(0,1,0)))
+#forecast for the next month
+forSar <- Sarima %>% 
+            forecast(h = 31)
+```
+
+As usual, let's plot the results.
+
+```{r Sarima Jan plot, echo=FALSE}
+par(mar = c(5,4,4,8),
+    xpd = TRUE) 
+forSar %>% 
+  plot(col = alpha("darkblue", alpha = 0.60), shaded = TRUE, shadecols = alpha("darkblue", alpha = 0.30), fcol ="blue",  
+       main = "Forecasting test series with SArima (6,1,1)(0,1,0)", xlab = "Date", ylab="total rides",
+       bty = "l", xaxt="n") #this removes the box
+ticks <- axTicks(1) #find where are the x ticks and give them a name
+axis(1, at = ticks, label = c(2011.01, 2011.06, 2012.01, 2012.06, 2013.01)) #rename the x ticks
+#grid(nx= NA, ny = NULL, lty = 2, col = "lightgray", lwd = 2) #this adds the grid
+legend(x="topright", inset = c(-0.3,0), lty = c(1,1), legend = c("Historical data", "Prediction"), col = c(alpha("darkblue", alpha = 0.60), "blue"))
+#zoom in
+par(mar = c(5,4,4,8),
+    xpd = TRUE) 
+forSar %>% 
+  plot(col = alpha("darkblue", alpha = 0.60), shaded = TRUE, shadecols = alpha("darkblue", alpha = 0.30), fcol ="blue",  
+       main = "Forecasting test series with SArima (6,1,1)(0,1,0)", xlab = "Last 60 days of 2012 + 31 days forecast", ylab="total rides",
+       bty = "l", xaxt="n", include = 91) #this removes the box
+#grid(nx= NA, ny = NULL, lty = 2, col = "lightgray", lwd = 2) #this adds the grid
+legend(x="topright", inset = c(-0.3,0), lty = c(1,1), legend = c("Historical data", "Prediction"), col = c(alpha("darkblue", alpha = 0.60), "blue"))
+```
+
+The Sarima(6,1,1)(0,1,0) model forecast a modest increase in the number of bike rides in the month of January compared to the end of December. However, it shows a a high day-to-day volatility with continuous up and down. The predictions suggest that it may not be great idea to increase price in this period, since the upward trend is in its begging phase. It may be more clever to keep prices reasonably low to try to push even more upward the trend. Then, it it will be consolidated, increasing prices.
+Finally, let's consider accuracy measures.
+
+```{r SARIMA acc}
+accuracy(Sarima)
+```
+
+On average, the predictions will be off by the 9.7% and the predicted rides will differ from the real number of rides by 425. Again, this is a fairly good result to have an idea of how users could behave during January 2013.
+
+Of course, the model has some room for improvement. Its biggest pitfall is the lack of data. Rides have shown a yearly seasonality, but the sample was just 2-years (i.e 2 seasonal period) long. Collecting more data (i.e for year 2013, 2014 and so on), and then re-estimate the model likely will produce better forecast since the seasonality term may be better considered into the model.
+Another strategy may be to add a GARCH model on the residuals to have an idea of the fitted variance for the conditional data point. Then, use this points to make better forecasts. Residuals analysis points that implementing this strategy may make predictions even more precise.
+
+## ARDL Model
+
+To have a 365-degree view of the number of bike rides it is useful to inquire which variables are significant in determining the number of rides. Temperature, wind speed, humidity and whether or not it is a working day are all variables that could influence the number of total rides in a day. As a consequence, building a model that disentangle this relation helps in understanding how users behave.
+To do so, the first step is to perform an ADF test on all of variables.
+
+```{r ARDL adf}
+summary(ur.df(day$temp, 
+                  type = "trend", 
+                  lags = 180, 
+                  selectlags = "BIC"))
+#humidity
+summary(ur.df(day$humidity, 
+                  type = "trend", 
+                  lags = 180, 
+                  selectlags = "BIC"))
+#windspeed
+summary(ur.df(day$windspeed, 
+                  type = "trend", 
+                  lags = 180, 
+                  selectlags = "BIC"))
+```
+
+Humidity and windspees are I(0), while temperature is I(1). As seen before, trb is I(1). Working day, instead, is a dummy variable. The variables' order suggest that an ARDL is suitable for our data. In order to have an idea of the correlation between variables, it may be useful to plot their correlogram.
+
+```{r correlogram, echo=FALSE}
+#create a database with the correlation of the varibales useufl for the OLS
+corday <- select(day, trb,temp, temp_feel,humidity, windspeed, casual, registered)
+corMat <- cor(corday)
+#show them
+corMat
+library(corrplot)
+corrplot(corMat, type = "lower", method = "color", 
+         outline = T, addCoef.col = "white", tl.col = "black")
+```
+
+The total number of rides is highly correlated with the temperature and the perceived temperature, but it does not appear to be as much linked to the humidity and wind speed. Interestingly, it is more correlated with registered rides than casual rides. This may be because registered tend to do more trips (remember that trb = registered + casuals).
+
+Let's try to fit a quick ARDL to the data, and then deal with issues that may arise. The model eqquation is:
+
+trbc_ts ~ temp + hum + wind + workday
+
+To fit an ARDL, the first step is to compute the BIC and AIC to determine the lag order of the parameters. Models with lowest AIC/BIC are better.
+
+```{r lag choice}
+#transform objects into ts
+temp <- ts(day$temp, start = c(2011), frequency = 365)
+hum <- ts(day$humidity, start = c(2011), frequency = 365)
+wind <- ts(day$windspeed, start = c(2011), frequency = 365)
+#set the df for the ardl
+dfardl <- data.frame(trbc_ts, temp, hum, wind, day$workingday)
+#rename a column
+names(dfardl)[names(dfardl) == "day.workingday"] <- "workday"
+#find the proper ardl paramters
+#why ardl? becasue y is of order 1 and at least one of x is of order 1 (temp)
+library(dLagM)
+#BIC
+ardlBIC <- dfardl %>% 
+    ardlBound(trbc_ts ~ temp + hum + wind + workday, case = 3, p = NULL,
+                       remove = NULL, autoOrder = FALSE, ic = "BIC" , max.p = 4, max.q = 6, 
+                       ECM = TRUE, stability = TRUE)
+#4,1,4,1
+#AIC
+ardlAIC <- dfardl %>% 
+  ardlBound(trbc_ts ~ temp + hum + wind + workday, case = 3, p = NULL,
+            remove = NULL, autoOrder = FALSE, ic = "AIC" , max.p = 4, max.q = 6, 
+            ECM = TRUE, stability = TRUE)
+#4,1,4,1
+```
+
+Both the AIC and the BIC suggests an order of 4,1,4,1,0 for the variables. The next step is to estimate the ARDL parameters by using these lag orders.
+
+```{r ARDL}
+library(ARDL)
+ardl <- ardl(trbc_ts ~ temp + hum + wind + workday, data=dfardl, order = c(1,2,2,1,0))
+summary(ardl)
+```
+
+All the parameters and their respective lags appears to be statistically significant with an high level. To evaluate the model, it could be useful to plot the fitted values against the real values.
+
+```{r fv vs rv, echo=FALSE}
+#fitted values
+fv <- fitted.values(ardl)
+fv <- ts(fv, start = c(2011), frequency = 365)
+#plot the model estimation and the real values
+library(scales)
+par(mar = c(5,4,4,8),
+    xpd = TRUE)
+plot.ts(fv,type="l",col=alpha("darkblue", alpha=0.7), main ="Total Rides - ARDL vs actual values", 
+        xlab = "Date", ylab = "total rides", axes = TRUE, bty="l", xaxt="n")
+lines(trbc_ts,col= alpha("darkorange",alpha=0.5))
+ticks3 <- axTicks(1)
+axis(1, at=ticks3, label = c(2011.01, 2011.06, 2012.01, 2012.06, 2013.01))
+legend(x="topright", inset = c(-0.3,0), lty = c(1,1), legend = c("ARDL", "Actual Data"), col = c(alpha("darkblue",alpha=0.7), alpha("darkorange",alpha=0.5)))
+```
+
+The model catches fairly good the movements of the real data even though it has some higher peaks and lower values. The main issue, however, is with point 67 and 68 that appears to be way larger than the actual values. Especially point 68 is negative while the number of ride bikes can go below 0. This may be a consequence of some outliers in the independent variables. As regards, the approach is to detect those outliers and replace. Note that this is a step that in more precise analysis should be performed before fitting the model. This studio fitted beforehand the ARDL just to have a quick view of the possible issues.
+
+```{r outliers}
+# hum outliers
+find_mild_out(hum) #2
+find_severe_out(hum) #0
+#temp out
+find_mild_out(temp) #0
+find_severe_out(temp) #0
+#wind out
+find_mild_out(wind) #13
+find_severe_out(wind) #0
+```
+
+Humidity has 2 outliers while wind speed has 13. No outliers for the temp. Now it is necessary to correct these outliers before re-setting an ARDL model. Now let's substitute outliers with the mean of the series and re-fit the values.
+
+```{r out sub2}
+#remove outliers from humc
+library(MASS)
+humc <- rem_out(hum)
+windc <- rem_out(wind)
+#add those to dfardl
+dfardl$humc = humc
+dfardl$windc = windc
+```
+```{r out sub, echo=FALSE}
+#plot it
+par(mfrow = c(1,1))
+boxplot(humc, border = "darkblue", col = "darkorange")
+title("Corrected humidity") #no longer outliers
+#plot it
+boxplot(windc, border = "darkblue", col = "darkorange")
+title("Corrected Wind speed") #still has some outliers
+```
+
+To double check the order of the parameters, let's compute the BIC again to select the best model. 
+
+```{r BIC2}
+#compute the BIC for ARDL again
+ardlBIC2 <- dfardl %>% 
+  ardlBound(trbc_ts ~ temp + humc + windc, case = 4, p = NULL,
+            remove = NULL, autoOrder = FALSE, ic = "BIC" , max.p = 4, max.q = 4, 
+            ECM = TRUE, stability = TRUE)
+```
+
+Now fit the model with the given parameters (5,1,1,4) by adding also a trend.
+
+```{r ardl2}
+ardl2 <- ardl(trbc_ts ~ temp + humc + windc + trend(trbc_ts) | workday, data=dfardl, order = c(5,1,1,4))
+summary(ardl2)
+```
+
+Interestingly, the upward trend in the total rides is relevant. Morevoer, the past rides appears to be statistically significant up to 2 lags (i.e days) before. Moreover, they have a positive relation. As predictable, the temperature is statistically significant both at lag0 and lag1. It is positively related to trb when it is at lag0 (the higher the temp, the more rides) and negatively related to the temperature of the day before (this can be a consequence of weather forecasts or the idea that if it is really hot today, tomorrow may be cooler). Finally both wind and humidity are relevant at lag0, and they have the expected direction. The stronger the wind, the lower the rides since the wind makes riding a bike become harder; while a higher humidity may point to a rainy day, thus making the users opt for other types transportation. Finally, as predictable, whether or not it is a working day is statistically significant.
+Plotting the ARDL's fitted values against the real values is the best way to assess the goodness of the model.
+
+```{r fv, echo=FALSE}
+#compute the fitted values
+fv2 <- fitted.values(ardl2)
+fv2 <- ts(fv2, start = c(2011), frequency = 365)
+#plot the model estimation and the real values
+library(scales)
+par(mfrow=c(1,1))
+par(mar = c(5,4,4,8),
+    xpd = TRUE)
+plot.ts(fv2,type="l",col=alpha("darkblue", alpha=0.7), main ="Total Rides - ARDL vs actual values", 
+        xlab = "Date", ylab = "total rides", axes = TRUE, bty="l", xaxt="n")
+lines(trbc_ts,col= alpha("darkorange",alpha=0.5))
+ticks3 <- axTicks(1)
+axis(1, at=ticks3, label = c(2011.01, 2011.06, 2012.01, 2012.06, 2013.01))
+legend(x="topright", inset = c(-0.3,0), lty = c(1,1), legend = c("ARDL", "Actual Data"), col = c(alpha("darkblue",alpha=0.7), alpha("darkorange",alpha=0.5)))
+#problem at point 67-68 resolved
+```
+
+The model succeed both in catching the trend and the seasonality of the data. It also seems to catch the direction of the daily movement, even tough from time to time it anticipates them. The main issue with the model is its estimation's magnitude, that sometimes tend to underestimate the real value. Let's conside the accuracy of the model to have a complete view of its performances.
+
+```{r ardl2 acc}
+accuracy(ardl2)
+```
+
+MAPE suggests that on average the ARDL prediction will be 15% off from the real value. Since this is a model developed just to gain a better idea of what influences the number of total rides, a margin of error of the 15% (or around 504 bikes) is not a bad result as a starting point to implement a dynamic pricing strategy based on different day-to-day variables.
+Of course, the model could be ameliorate. The main suggestion is, again, to re-build the model when more data will be available (5+ years). If this is the case, it will be easier to include the seasonality into the model to achieve more accurate predictions. 
+Including variables that have not been considered can decrease the margin of error too. As an example, it could be convenient to add a rainy-day dummy variable to account for those day when it rained.
+Finally, since the error terms appeared to be heteroskedastic, the model has been re-estimated with a robust formula. The significane level, however, did not change. Moreover, errors are not autocorrelated. The issues is with the normality likeliness of the error distribution, since the jarque bera test rejects it. Neverthless, this may be due to the large sample, since in such a situation the jb test may rejects normality even for the smallest movement from it.
+
+```{r homosk}
+library(lmtest)
+library(sandwich)
+dwtest(ardl2)
+#p-value > 0.05 -> not autocorrelation among residuals
+#START FROM HERE
+#heterosked
+bptest(ardl2) #H0 is homoskedasticity
+#heteroskedasticity
+#re-estimate the model with robust se
+ardlrob<- coeftest(ardl2, vcov = sandwich)
+```
+
+## Findings and Insights
+
+First of all, let's discuss about the findings about the total rides as a time series. There are 2 main things to grasp: it has a seasonality of 365 days (even though at the moment this seasonality has just 2 periods) and it is of order I(1), i.e it is a non-stationary ts that can be made stationary by first-differencing.
+Then, there are different insights that come from this analysis:
+
+- The number of rides has risen from 2011 to 2012. This may be due to an increase of available bikes.
+- The seasons that shows higher rides is Summer, while the one with the lowest is winter. As such, an increase price during the summer period and a lower price in the winter period may be good strategy to profit more, since people will probably ride a bike on summer even with higher prices while in the coolest month lower price may attract more customers.
+- Clear day are the one when users ride more. The number of riders drastically decreases when it snows, as predictable. As such, in snowy days re-organize the bikes by splitting equally them among different docks may be a good strategy to ensure the availability in every dock when the bikes are more requested.
+- Temperature and number of rides appears to have a positive relations. However, number of rides tend to cluster when the normalized humidity is higher than 0.5 and wind speed is lower than 0.4.
+- The best model to predict future values is the SARIMA(6,1,1)(0,1,0). It predicts a slow recover from the shrink in rides that December experienced. Highly variability among days remain. To further push this upward trend, a low price may be the right choice. In this case, the low price could attract more customers that will pushing even more upward the number of rides. Based on previous year, it could be suggested to increase again the price around the end of February/half of March to better exploit the upward trend. Consider then re-lowering the prices by the end of October to try to stop the (likely) downard trend that may come.
+- It is suggested to do maintenance intervention in the months of November, December and January when the demand for bikes is at its lowest level in order to avoid disruption of the service when customer need it more.
+- To understand the high day-to-day volatility, an ARDL(5,1,1,4) with a dummy and trend was developed. It showed that temperature, wind speed, humidity and whether or not it is a working day are all statistically significant variables in determining the daily number of rides. Developing a strategy based also on this considerations may increase more the chances of placing the right price at the right time. For example, Days with strong wind may be perfect to re-organize the bike positioning, while days with the warmer temperature may be the perfect occasions to offer daily ride buses (i.e discounted price on the 3rd rides if you do all three rides in the same day and so on) to attract even more customers.
+
+## Models' limits and improvements
+
+Models have some room for improvement. Especially:
+
+- Repeat this study when more data is available will surely improve the forecasts' accuracy.
+- Not-predictable event may happens. If it is the case, the model could fail in forecasting the number of rides in that period.
+- A GARCH model could be added to ARIMA in order to model the variance of the residuals and have a better view of the situation.
+- More variables could be added to the ARDL model based on what the business is interested into. Be aware of avoiding the problem of multicollinearity. 
+- Other model could have been developed, like an OLS estimator.
+
+
+
